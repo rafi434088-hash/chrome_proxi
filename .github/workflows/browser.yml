@@ -19,13 +19,13 @@ jobs:
 
       - name: Install Cloudflared
         run: |
-          wget -q [https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb](https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb￼)
-          sudo dpkg -i cloudflared-linux-amd64.deb
+          wget -q -O cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
 
       - name: Start Xpra
         run: |
           xpra start :100 \
-            --bind-tcp=[0.0.0.0:14500](http://0.0.0.0:14500) \
+            --bind-tcp=0.0.0.0:14500 \
             --html=on \
             --daemon=yes \
             --exit-with-children \
