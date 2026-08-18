@@ -58,6 +58,7 @@ jobs:
           xpra start :100 \
             --bind-tcp=0.0.0.0:41234 \
             --html=on \
+            --websocket-upgrade=yes \
             --daemon=yes \
             --exit-with-children=yes \
             --resize-display=1280x720 \
@@ -109,7 +110,7 @@ jobs:
           sleep 5
           echo "=============================================================="
           echo " OPEN THIS URL IN YOUR BROWSER:"
-          echo " https://SSH.TSOOLGEE.UK/?sound=on&audio_codec=mp3&clipboard=on"
+          echo " https://ssh.tsoolgee.uk/?sound=on&audio_codec=mp3&clipboard=on&encrypt=off"
           echo "=============================================================="
 
       - name: Keep Alive
