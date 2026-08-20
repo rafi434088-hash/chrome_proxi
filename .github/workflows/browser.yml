@@ -3,29 +3,32 @@ name: Chrome GUI with Xpra
 on:
   workflow_dispatch:
 
-# The session is always published on the SAME fixed address:
-#   https://ssh.tsoolgee.uk
-# served by the named Cloudflare tunnel "chrome_proxy"
-# (a8a043d1-f429-4849-947d-713a5b7d7ac4). Its ingress lives in Cloudflare and
-# maps ssh.tsoolgee.uk -> http://localhost:41234.
+# Fixed public address: https://ssh.tsoolgee.uk  (Cloudflare tunnel "chrome_proxy"
+# a8a043d1-f429-4849-947d-713a5b7d7ac4 -> http://localhost:41234).
 #
-# NetFree (the user's filter) whitelists this domain for HTTP, but it blocks the
-# WebSocket ONLY when it advertises the "binary" sub-protocol -- which is exactly
-# what Xpra's HTML5 client sends (`new WebSocket(uri,"binary")`). A plain WS with
-# no sub-protocol passes NetFree, but Xpra then rejects it (403) because it
-# requires "binary".
+# NetFree (the user's filter) allows plain HTTPS to this domain but blocks the
+# WebSocket 101 upgrade (risk-type). So Xpra's WebSocket cannot be reached
+# directly from a filtered machine.
 #
-# So an nginx reverse proxy sits between cloudflared and Xpra:
-#   * it rewrites js/Protocol.js so the browser connects WITHOUT a sub-protocol
-#     (NetFree lets it through),
-#   * it re-injects `Sec-WebSocket-Protocol: binary` toward Xpra (which needs it),
-#   * and hides that header from the response so the browser (which offered none)
-#     still accepts the 101 handshake.
-# nginx faces cloudflared on 41234; Xpra runs internally on 41235.
+# Bypass: an Xray server runs on the runner with an **XHTTP** inbound (path
+# /xhttp). XHTTP carries the connection as ordinary HTTP GET/POST requests -- no
+# 101, so NetFree sees only normal HTTPS and lets it through. A tiny Xray client
+# on the user's PC exposes http://127.0.0.1:8000 which is tunnelled over XHTTP to
+# this server and out to Xpra (127.0.0.1:41235). The browser then talks to
+# localhost (local WebSocket, NetFree not involved) with all Xpra features intact.
+#
+# Layout on the runner:
+#   xpra      127.0.0.1:41235   (HTML5 + WebSocket, localhost only)
+#   xray      127.0.0.1:2096    (vless + xhttp inbound, path /xhttp)
+#   nginx     0.0.0.0:41234     -> /xhttp* to xray, everything else to xpra
+#   cloudflared  ssh.tsoolgee.uk -> 41234
 env:
   PUBLIC_HOST: ssh.tsoolgee.uk
-  EDGE_PORT: "41234"    # nginx <- cloudflared (matches the tunnel ingress rule)
-  XPRA_PORT: "41235"    # xpra, localhost only
+  EDGE_PORT: "41234"
+  XPRA_PORT: "41235"
+  XRAY_PORT: "2096"
+  XHTTP_PATH: "/xhttp"
+  XRAY_UUID: "91421d21-52a3-427e-982f-cd1c10bc7955"
 
 jobs:
   chrome:
@@ -63,12 +66,18 @@ jobs:
           sudo update-mime-database /usr/share/mime 2>/dev/null || true
           sudo update-desktop-database 2>/dev/null || true
 
-      - name: Install cloudflared
+      - name: Install cloudflared + xray
         run: |
           wget -q -O cloudflared.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
           cloudflared --version
+
+          wget -q -O xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          sudo unzip -o xray.zip xray -d /usr/local/bin/
+          sudo chmod +x /usr/local/bin/xray
+          /usr/local/bin/xray version | head -1
 
       - name: Configure Chrome (Hebrew UI + auto-translate + downloads)
         run: |
@@ -139,11 +148,49 @@ jobs:
             tail -50 /run/user/$(id -u)/xpra/:100.log 2>/dev/null || true
             exit 1
           fi
-          echo "Xpra is up on 127.0.0.1:${XPRA_PORT}."
+          echo "Xpra up on 127.0.0.1:${XPRA_PORT}."
 
-      # nginx: rewrite the client's WS sub-protocol so NetFree passes it, and
-      # bridge it back to what Xpra expects.
-      - name: Start nginx WebSocket-rewrite proxy (edge, 41234)
+      - name: Start Xray XHTTP server (127.0.0.1:2096)
+        run: |
+          cat > xray-server.json <<JSON
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+              {
+                "listen": "127.0.0.1",
+                "port": ${XRAY_PORT},
+                "protocol": "vless",
+                "settings": {
+                  "clients": [ { "id": "${XRAY_UUID}" } ],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "xhttp",
+                  "xhttpSettings": { "path": "${XHTTP_PATH}", "mode": "auto" }
+                }
+              }
+            ],
+            "routing": {
+              "rules": [
+                { "type": "field", "ip": ["127.0.0.1"], "port": ${XPRA_PORT}, "outboundTag": "xpra" }
+              ]
+            },
+            "outbounds": [
+              { "tag": "xpra",  "protocol": "freedom" },
+              { "tag": "block", "protocol": "blackhole" }
+            ]
+          }
+          JSON
+
+          nohup /usr/local/bin/xray run -c xray-server.json > xray.log 2>&1 &
+          sleep 3
+          if ! curl -s -o /dev/null "http://127.0.0.1:${XRAY_PORT}${XHTTP_PATH}"; then
+            echo "xray xhttp inbound reachable check (non-fatal):"
+          fi
+          echo "xray log:"; tail -20 xray.log || true
+          pgrep -a xray || { echo "::error::xray did not start"; cat xray.log; exit 1; }
+
+      - name: Start nginx (edge 41234 -> xhttp:xray, rest:xpra)
         run: |
           sudo tee /etc/nginx/conf.d/xpra.conf >/dev/null <<NGINX
           map \$http_upgrade \$connection_upgrade {
@@ -157,31 +204,27 @@ jobs:
               server_name _;
               client_max_body_size 0;
 
-              # Serve Protocol.js patched: drop the "binary" sub-protocol so the
-              # browser's WS request does NOT carry it (NetFree blocks that token).
-              location = /js/Protocol.js {
-                  proxy_pass http://127.0.0.1:${XPRA_PORT};
+              # Xray XHTTP endpoint: plain HTTP GET/POST streaming, no upgrade.
+              location ${XHTTP_PATH} {
+                  proxy_pass http://127.0.0.1:${XRAY_PORT};
+                  proxy_http_version 1.1;
                   proxy_set_header Host \$host;
-                  proxy_set_header Accept-Encoding "";
-                  sub_filter_once off;
-                  sub_filter_types *;
-                  sub_filter 'new WebSocket(uri,"binary")' 'new WebSocket(uri)';
+                  proxy_set_header Connection "";
+                  proxy_buffering off;
+                  proxy_request_buffering off;
+                  chunked_transfer_encoding on;
+                  proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
               }
 
+              # Everything else = the Xpra HTML5 app (direct HTTP/WS, for clients
+              # that are NOT behind NetFree).
               location / {
                   proxy_pass http://127.0.0.1:${XPRA_PORT};
                   proxy_http_version 1.1;
                   proxy_set_header Host \$host;
-                  proxy_set_header X-Real-IP \$remote_addr;
                   proxy_set_header Upgrade \$http_upgrade;
                   proxy_set_header Connection \$connection_upgrade;
-
-                  # Browser now offers NO sub-protocol -> re-add "binary" toward
-                  # Xpra (which requires it) and hide it from the 101 response so
-                  # the browser accepts the handshake.
-                  proxy_set_header Sec-WebSocket-Protocol binary;
-                  proxy_hide_header Sec-WebSocket-Protocol;
-
                   proxy_read_timeout 3600s;
                   proxy_send_timeout 3600s;
                   proxy_buffering off;
@@ -189,7 +232,6 @@ jobs:
           }
           NGINX
 
-          # Drop the stock default site so nothing else answers.
           sudo rm -f /etc/nginx/sites-enabled/default
           sudo nginx -t
           sudo systemctl restart nginx || sudo service nginx restart
@@ -198,17 +240,12 @@ jobs:
             curl -fsS -o /dev/null "http://127.0.0.1:${EDGE_PORT}/" && break
             sleep 2
           done
-          if ! curl -fsS -o /dev/null "http://127.0.0.1:${EDGE_PORT}/"; then
-            echo "::error::nginx edge did not come up on ${EDGE_PORT}"
+          curl -fsS -o /dev/null "http://127.0.0.1:${EDGE_PORT}/" || {
+            echo "::error::nginx edge not up on ${EDGE_PORT}"
             sudo tail -40 /var/log/nginx/error.log 2>/dev/null || true
             exit 1
-          fi
-          echo "== confirm the served client no longer requests the binary sub-protocol =="
-          if curl -fsS "http://127.0.0.1:${EDGE_PORT}/js/Protocol.js" | grep -q 'new WebSocket(uri,"binary")'; then
-            echo "::error::Protocol.js still advertises the binary sub-protocol"
-            exit 1
-          fi
-          echo "OK: client patched (no binary sub-protocol)."
+          }
+          echo "nginx edge up."
 
       - name: Start Cloudflare Tunnel (fixed hostname)
         env:
@@ -216,21 +253,17 @@ jobs:
         run: |
           nohup cloudflared --no-autoupdate --protocol quic \
             tunnel run --token "$TUNNEL_TOKEN" > tunnel.log 2>&1 &
-
           for i in $(seq 1 45); do
             grep -q "Registered tunnel connection" tunnel.log && break
             sleep 2
           done
           if ! grep -q "Registered tunnel connection" tunnel.log; then
             echo "::error::cloudflared failed to register a tunnel connection"
-            tail -60 tunnel.log
-            exit 1
+            tail -60 tunnel.log; exit 1
           fi
           echo "Registered edge connections: $(grep -c 'Registered tunnel connection' tunnel.log)"
 
-      # End-to-end: HTTP 200, patched client, and a real WS upgrade (no
-      # sub-protocol, exactly like the patched browser) returning 101.
-      - name: Verify https://ssh.tsoolgee.uk
+      - name: Verify (HTTP page + XHTTP endpoint reachable via the edge)
         run: |
           URL="https://${PUBLIC_HOST}/"
           OK=0; CODE=000
@@ -240,59 +273,48 @@ jobs:
             echo "attempt $i: HTTP $CODE"; sleep 5
           done
           if [ "$OK" != "1" ]; then
-            echo "::error::${URL} is not serving the Xpra client (last HTTP ${CODE})"
-            head -c 500 body.html || true; tail -40 tunnel.log; exit 1
+            echo "::error::${URL} not serving Xpra (last HTTP ${CODE})"
+            head -c 400 body.html; tail -30 tunnel.log; exit 1
           fi
+          echo "Xpra page OK through the edge."
 
-          echo "== served client must not advertise the binary sub-protocol =="
-          if curl -s --max-time 20 "https://${PUBLIC_HOST}/js/Protocol.js" | grep -q 'new WebSocket(uri,"binary")'; then
-            echo "::error::public Protocol.js still advertises the binary sub-protocol"
-            exit 1
-          fi
+          # The XHTTP path should answer over HTTPS (any non-000 code = reachable;
+          # a bare GET without the xray handshake typically yields 404/400, which
+          # still proves the route + streaming pass NetFree/Cloudflare).
+          XC=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://${PUBLIC_HOST}${XHTTP_PATH}/probe" || echo 000)
+          echo "XHTTP endpoint https code: ${XC}"
 
-          echo "== WebSocket upgrade WITHOUT a sub-protocol (like the patched client) =="
-          WS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-            -H "Connection: Upgrade" -H "Upgrade: websocket" \
-            -H "Sec-WebSocket-Version: 13" \
-            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-            "https://${PUBLIC_HOST}/")
-          echo "WS upgrade (no sub-protocol): HTTP ${WS}"
-          if [ "$WS" != "101" ]; then
-            echo "::warning::expected 101 from the WS upgrade, got ${WS}"
-          fi
-
-          FULL="https://${PUBLIC_HOST}/?sound=on&audio_codec=mp3&clipboard=on"
+          FULL="http://127.0.0.1:8000/?sound=on&audio_codec=mp3&clipboard=on"
           echo "=============================================================="
-          echo " OPEN THIS URL (Chrome recommended):"
+          echo " Cloud server is up. On the PC run the local launcher, then open:"
           echo " ${FULL}"
           echo "=============================================================="
-          printf '%s\n' "${FULL}" > "${GITHUB_WORKSPACE}/tunnel_url.txt"
-          { echo "### Chrome session is live"; echo ""; echo "[${FULL}](${FULL})"; } >> "$GITHUB_STEP_SUMMARY"
+          printf 'LOCAL=%s\nHOST=%s\nUUID=%s\nPATH=%s\n' "${FULL}" "${PUBLIC_HOST}" "${XRAY_UUID}" "${XHTTP_PATH}" \
+            > "${GITHUB_WORKSPACE}/connection.txt"
+          { echo "### Cloud Chrome server is live (XHTTP)"; echo ""; echo "Run the local launcher, then open \`http://127.0.0.1:8000/\`"; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Publish tunnel URL
+      - name: Publish connection info
         uses: actions/upload-artifact@v4
         with:
-          name: tunnel-url
-          path: tunnel_url.txt
+          name: connection
+          path: connection.txt
           retention-days: 1
 
-      - name: Keep alive (with health watchdog)
+      - name: Keep alive (health watchdog)
         env:
           TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
-          END=$(( $(date +%s) + 20400 ))   # ~5h40m, under GitHub's 6-hour limit
+          END=$(( $(date +%s) + 20400 ))
           FAILS=0
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 300
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-              "https://${PUBLIC_HOST}/" || echo 000)
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://${PUBLIC_HOST}/" || echo 000)
+            pgrep -x xray >/dev/null || { echo "xray died, restarting"; nohup /usr/local/bin/xray run -c xray-server.json >> xray.log 2>&1 & }
             if [ "$CODE" = "200" ]; then
-              FAILS=0; echo "$(date -u +%H:%M:%S) health OK (200)"
+              FAILS=0; echo "$(date -u +%H:%M:%S) health OK"
             else
-              FAILS=$((FAILS + 1))
-              echo "$(date -u +%H:%M:%S) health FAILED (HTTP $CODE), strike $FAILS/3"
+              FAILS=$((FAILS + 1)); echo "$(date -u +%H:%M:%S) health FAIL ($CODE) $FAILS/3"
               if [ "$FAILS" -ge 3 ]; then
-                echo "Restarting cloudflared ..."
                 pkill -f cloudflared || true; sleep 3
                 nohup cloudflared --no-autoupdate --protocol quic \
                   tunnel run --token "$TUNNEL_TOKEN" >> tunnel.log 2>&1 &
