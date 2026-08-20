@@ -19,8 +19,8 @@ jobs:
 
       - name: Install Cloudflared
         run: |
-          wget -q -O cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
 
       - name: Start Xpra
         run: |
@@ -47,15 +47,15 @@ jobs:
               --window-size=854,480"
 
       - name: Start Cloudflare Tunnel
-        env:
-          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
-          cloudflared tunnel run --token "$TUNNEL_TOKEN" > tunnel.log 2>&1 &
+          cloudflared tunnel \
+            --url http://localhost:14500 \
+            > tunnel.log 2>&1 &
 
           sleep 10
 
           echo "Tunnel URL:"
-          echo "https://ssh.tsoolgee.uk"
+          grep -o "https://[-a-zA-Z0-9.]*trycloudflare.com" tunnel.log || true
 
       - name: Keep Alive
         run: |
